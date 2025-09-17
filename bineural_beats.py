@@ -12,12 +12,14 @@ class BinauralBeatsApp:
         self.stream = None
         self.thread = None
         self.sr = 44100
-        self.duration = 60  # seconds
+        self.duration = None  # None means play until stopped
         self.volume = tk.DoubleVar(value=0.5)
         self.base_freq = tk.DoubleVar(value=200.0)
         self.beat_freq = tk.DoubleVar(value=10.0)
         self.mode = tk.StringVar(value="constant")
-        self.target_volume = self.volume.get()
+        self._cached_params = None  # To store cached values for audio thread
+        self._volume_lock = threading.Lock()
+        self._thread_volume = self.volume.get()
         self._build_ui()
 
     def _build_ui(self):
@@ -38,7 +40,9 @@ class BinauralBeatsApp:
         self.toggle_btn.grid(column=0, row=5, columnspan=2, pady=10)
 
     def on_volume_release(self, event):
-        self.target_volume = self.volume.get()
+        # Update thread-safe volume for audio thread
+        with self._volume_lock:
+            self._thread_volume = self.volume.get()
 
     def toggle_play(self):
         if self.is_playing:
@@ -56,6 +60,16 @@ class BinauralBeatsApp:
     def start(self):
         if self.is_playing:
             return
+        # Cache all needed values for the audio thread
+        self._cached_params = {
+            'base': float(self.base_freq.get()),
+            'beat': float(self.beat_freq.get()),
+            'mode': str(self.mode.get()),
+            'sr': self.sr,
+            'duration': self.duration  # Will be None for continuous
+        }
+        with self._volume_lock:
+            self._thread_volume = self.volume.get()
         self.is_playing = True
         self.thread = threading.Thread(target=self._play)
         self.thread.start()
@@ -70,18 +84,22 @@ class BinauralBeatsApp:
         self.update_toggle_btn()
 
     def _play(self):
-        base = float(self.base_freq.get())
-        beat = float(self.beat_freq.get())
-        sr = self.sr
-        duration = self.duration
-        frames_total = int(sr * duration)
-    # Remove vol here; use target_volume in callback
+        # Use cached parameters to avoid accessing Tkinter variables from audio thread
+        params = self._cached_params
+        base = params['base']
+        beat = params['beat']
+        mode = params['mode']
+        sr = params['sr']
+        duration = params['duration']
+        frames_total = None if duration is None else int(sr * duration)
         self.phase_left = 0.0
         self.phase_right = 0.0
         self.t_sample = 0
+
         def callback(outdata, frames, time, status):
-            mode = str(self.mode.get())  # Always get current mode
-            vol = self.target_volume  # Use target_volume directly, no smoothing
+            # Only read thread-safe volume variable
+            with self._volume_lock:
+                vol = self._thread_volume
             if not self.is_playing:
                 raise sd.CallbackStop()
             if mode == "constant":
@@ -118,12 +136,18 @@ class BinauralBeatsApp:
             stereo = np.stack([left, right], axis=1) * vol
             outdata[:frames] = stereo.astype(np.float32)
             self.t_sample += frames
+
         self.stream = sd.OutputStream(
             samplerate=sr, channels=2, callback=callback, blocksize=1024
         )
         with self.stream:
-            while self.is_playing and self.t_sample < frames_total:
-                sd.sleep(100)
+            # If frames_total is None, play until stopped
+            if frames_total is None:
+                while self.is_playing:
+                    sd.sleep(100)
+            else:
+                while self.is_playing and self.t_sample < frames_total:
+                    sd.sleep(100)
         self.t_sample = 0
 
 if __name__ == "__main__":
